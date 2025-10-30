@@ -37,9 +37,15 @@ type SystemTuneAgent struct {
 	memoryMutex         sync.RWMutex
 	shouldConsumeMemory bool
 
-	// 状态
+	// 状态跟踪
 	lastCPUUsage    float64
 	lastMemoryUsage float64
+	
+	// 动态平衡控制
+	baseCPUUsage    float64  // 不包含本程序的基础CPU使用率
+	baseMemoryUsage float64  // 不包含本程序的基础内存使用率
+	selfCPUUsage    float64  // 本程序的CPU占用估算
+	selfMemoryUsage float64  // 本程序的内存占用估算
 
 	// 控制
 	ctx    context.Context
@@ -60,12 +66,19 @@ func NewSystemTuneAgent(cpuThreshold, memoryThreshold float64) *SystemTuneAgent 
 }
 
 func (s *SystemTuneAgent) Start() error {
-	fmt.Printf("System Tune Agent 启动 (Go 版本)\n")
-	fmt.Printf("CPU 阈值: %.1f%%\n", s.cpuThreshold)
-	fmt.Printf("内存阈值: %.1f%%\n", s.memoryThreshold)
-	fmt.Printf("监控间隔: %v\n", monitorInterval)
-	fmt.Println("按 Ctrl+C 停止程序")
+	fmt.Printf("🚀 System Tune Agent 启动 (Go 版本 - 动态平衡优化)\n")
+	fmt.Printf("🎯 CPU 阈值: %.1f%%\n", s.cpuThreshold)
+	fmt.Printf("🎯 内存阈值: %.1f%%\n", s.memoryThreshold)
+	fmt.Printf("⏱️ 监控间隔: %v\n", monitorInterval)
+	fmt.Printf("🖥️ CPU 核心数: %d\n", runtime.NumCPU())
+	fmt.Println("✨ 动态平衡模式：当其他进程占用增加时，自动减少自身占用")
+	fmt.Println("⚠️ 按 Ctrl+C 停止程序")
 	fmt.Println()
+
+	// 初始化基础状态
+	if err := s.initializeBaseState(); err != nil {
+		return fmt.Errorf("初始化失败: %v", err)
+	}
 
 	// 启动监控循环
 	go s.monitorLoop()
@@ -75,8 +88,30 @@ func (s *SystemTuneAgent) Start() error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sigChan
-	fmt.Println("\n正在停止 System Tune Agent...")
+	fmt.Println("\n🛑 正在停止 System Tune Agent...")
 	s.Stop()
+	return nil
+}
+
+func (s *SystemTuneAgent) initializeBaseState() error {
+	// 获取初始状态，作为基础参考
+	cpuUsage, err := s.getCPUUsage()
+	if err != nil {
+		return fmt.Errorf("获取初始CPU使用率失败: %v", err)
+	}
+
+	memoryUsage, err := s.getMemoryUsage()
+	if err != nil {
+		return fmt.Errorf("获取初始内存使用率失败: %v", err)
+	}
+
+	// 初始状态下，所有占用都是基础占用
+	s.baseCPUUsage = cpuUsage
+	s.baseMemoryUsage = memoryUsage
+	s.selfCPUUsage = 0
+	s.selfMemoryUsage = 0
+
+	fmt.Printf("📊 初始状态 - CPU: %.1f%%, 内存: %.1f%%\n", cpuUsage, memoryUsage)
 	return nil
 }
 
@@ -114,11 +149,15 @@ func (s *SystemTuneAgent) monitorAndAdjust() {
 		return
 	}
 
-	fmt.Printf("当前状态 - CPU: %.1f%%, 内存: %.1f%%\n", cpuUsage, memoryUsage)
+	// 估算基础使用率（不包含本程序的占用）
+	s.estimateBaseUsage(cpuUsage, memoryUsage)
 
-	// 调整资源占用
-	s.adjustCPUConsumption(cpuUsage)
-	s.adjustMemoryConsumption(memoryUsage)
+	fmt.Printf("当前状态 - 总CPU: %.1f%%, 总内存: %.1f%% | 基础CPU: %.1f%%, 基础内存: %.1f%% | 自身CPU: %.1f%%, 自身内存: %.1f%%\n", 
+		cpuUsage, memoryUsage, s.baseCPUUsage, s.baseMemoryUsage, s.selfCPUUsage, s.selfMemoryUsage)
+
+	// 调整资源占用 - 基于动态平衡策略
+	s.adjustCPUConsumptionDynamic(cpuUsage)
+	s.adjustMemoryConsumptionDynamic(memoryUsage)
 
 	s.lastCPUUsage = cpuUsage
 	s.lastMemoryUsage = memoryUsage
@@ -142,38 +181,91 @@ func (s *SystemTuneAgent) getMemoryUsage() (float64, error) {
 	return memInfo.UsedPercent, nil
 }
 
-func (s *SystemTuneAgent) adjustCPUConsumption(currentCPUUsage float64) {
-	cpuGap := s.cpuThreshold - currentCPUUsage
+// 估算基础使用率和自身占用
+func (s *SystemTuneAgent) estimateBaseUsage(currentCPUUsage, currentMemoryUsage float64) {
+	// 估算自身CPU占用（基于当前强度）
+	s.cpuMutex.RLock()
+	intensity := s.cpuIntensity
+	s.cpuMutex.RUnlock()
+	
+	// CPU强度与实际占用的经验公式（可根据实际情况调整）
+	s.selfCPUUsage = float64(intensity) * 0.8 * float64(runtime.NumCPU()) / 100.0
+	if s.selfCPUUsage > currentCPUUsage {
+		s.selfCPUUsage = currentCPUUsage * 0.9 // 防止估算过高
+	}
+
+	// 估算自身内存占用
+	s.memoryMutex.RLock()
+	memoryBlocks := len(s.memoryBlocks)
+	s.memoryMutex.RUnlock()
+	
+	// 每个内存块平均大小估算
+	avgBlockSizeMB := 25.0 // 平均块大小
+	selfMemoryMB := float64(memoryBlocks) * avgBlockSizeMB
+	
+	// 获取总内存来计算百分比
+	if memInfo, err := mem.VirtualMemory(); err == nil {
+		totalMemoryMB := float64(memInfo.Total) / (1024 * 1024)
+		s.selfMemoryUsage = selfMemoryMB / totalMemoryMB * 100
+		if s.selfMemoryUsage > currentMemoryUsage {
+			s.selfMemoryUsage = currentMemoryUsage * 0.9 // 防止估算过高
+		}
+	}
+
+	// 计算基础使用率（其他进程的占用）
+	s.baseCPUUsage = math.Max(0, currentCPUUsage - s.selfCPUUsage)
+	s.baseMemoryUsage = math.Max(0, currentMemoryUsage - s.selfMemoryUsage)
+}
+
+// 动态平衡的CPU调整策略
+func (s *SystemTuneAgent) adjustCPUConsumptionDynamic(currentCPUUsage float64) {
+	// 计算需要的总占用和当前基础占用的差距
+	targetSelfCPU := math.Max(0, s.cpuThreshold - s.baseCPUUsage)
+	currentSelfCPU := s.selfCPUUsage
+	
+	// 如果基础占用已经超过阈值，立即停止自身占用
+	if s.baseCPUUsage >= s.cpuThreshold {
+		targetSelfCPU = 0
+		fmt.Printf("🔄 其他进程CPU占用过高(%.1f%% >= %.1f%%)，停止自身CPU占用\n", 
+			s.baseCPUUsage, s.cpuThreshold)
+	}
+
+	cpuGap := targetSelfCPU - currentSelfCPU
 
 	s.cpuMutex.Lock()
 	defer s.cpuMutex.Unlock()
 
 	newCPUIntensity := s.cpuIntensity
 
-	if math.Abs(cpuGap) > 0.5 {
-		if cpuGap > 2 {
-			// 差距较大，快速增加
-			increase := int(math.Max(5, cpuGap*1.5))
-			newCPUIntensity = int(math.Min(80, float64(s.cpuIntensity+increase)))
-		} else if cpuGap > 0 {
-			// 差距较小，缓慢增加
-			increase := int(math.Max(1, cpuGap))
-			newCPUIntensity = int(math.Min(60, float64(s.cpuIntensity+increase)))
-		} else if cpuGap < -2 {
-			// 超出较多，快速减少
-			decrease := int(math.Min(-5, cpuGap*1.5))
-			newCPUIntensity = int(math.Max(0, float64(s.cpuIntensity+decrease)))
+	if math.Abs(cpuGap) > 1.0 {
+		// 根据差距调整强度
+		intensityChange := int(cpuGap * 2.0) // 调整系数
+		
+		if cpuGap > 0 {
+			// 需要增加占用
+			if cpuGap > 5 {
+				intensityChange = int(math.Min(15, cpuGap*1.5)) // 快速增加
+			} else {
+				intensityChange = int(math.Max(2, cpuGap*0.8)) // 缓慢增加
+			}
+			newCPUIntensity = int(math.Min(90, float64(s.cpuIntensity + intensityChange)))
 		} else {
-			// 轻微超出，缓慢减少
-			decrease := int(math.Min(-1, cpuGap))
-			newCPUIntensity = int(math.Max(0, float64(s.cpuIntensity+decrease)))
+			// 需要减少占用
+			if cpuGap < -5 {
+				intensityChange = int(math.Max(-20, cpuGap*2)) // 快速减少
+			} else {
+				intensityChange = int(math.Min(-2, cpuGap*1.2)) // 缓慢减少
+			}
+			newCPUIntensity = int(math.Max(0, float64(s.cpuIntensity + intensityChange)))
 		}
 	}
 
 	if newCPUIntensity != s.cpuIntensity {
+		oldIntensity := s.cpuIntensity
 		s.cpuIntensity = newCPUIntensity
-		fmt.Printf("调整 CPU 强度: %d%% (当前: %.1f%%, 目标: %.1f%%)\n",
-			s.cpuIntensity, currentCPUUsage, s.cpuThreshold)
+		
+		fmt.Printf("🎯 调整CPU强度: %d%% -> %d%% (目标自身占用: %.1f%%, 当前: %.1f%%)\n",
+			oldIntensity, s.cpuIntensity, targetSelfCPU, currentSelfCPU)
 
 		if s.cpuIntensity > 0 && len(s.cpuWorkers) == 0 {
 			s.startCPUConsumption()
@@ -246,36 +338,55 @@ func (s *SystemTuneAgent) stopCPUConsumption() {
 	fmt.Println("停止 CPU 占用")
 }
 
-func (s *SystemTuneAgent) adjustMemoryConsumption(currentMemoryUsage float64) {
-	memoryGap := s.memoryThreshold - currentMemoryUsage
+// 动态平衡的内存调整策略
+func (s *SystemTuneAgent) adjustMemoryConsumptionDynamic(currentMemoryUsage float64) {
+	// 计算需要的自身内存占用
+	targetSelfMemory := math.Max(0, s.memoryThreshold - s.baseMemoryUsage)
+	currentSelfMemory := s.selfMemoryUsage
+	
+	// 如果基础占用已经超过阈值，立即释放自身占用
+	if s.baseMemoryUsage >= s.memoryThreshold {
+		targetSelfMemory = 0
+		fmt.Printf("🔄 其他进程内存占用过高(%.1f%% >= %.1f%%)，释放自身内存占用\n", 
+			s.baseMemoryUsage, s.memoryThreshold)
+	}
+
+	memoryGap := targetSelfMemory - currentSelfMemory
 
 	s.memoryMutex.Lock()
 	defer s.memoryMutex.Unlock()
 
-	fmt.Printf("内存状态 - 当前: %.1f%%, 目标: %.1f%%, 差距: %.1f%%, 已分配块: %d\n",
-		currentMemoryUsage, s.memoryThreshold, memoryGap, len(s.memoryBlocks))
+	fmt.Printf("📊 内存状态 - 总: %.1f%%, 基础: %.1f%%, 自身: %.1f%% -> 目标: %.1f%%, 差距: %.1f%%, 已分配块: %d\n",
+		currentMemoryUsage, s.baseMemoryUsage, currentSelfMemory, targetSelfMemory, memoryGap, len(s.memoryBlocks))
 
 	if math.Abs(memoryGap) > 1 {
-		if memoryGap > 3 && !s.shouldConsumeMemory {
-			// 差距较大，开始增加内存占用
+		if memoryGap > 2 && !s.shouldConsumeMemory {
+			// 需要增加内存占用
 			s.shouldConsumeMemory = true
-			go s.startMemoryConsumption()
-			fmt.Printf("开始增加内存占用，目标: %.1f%%\n", s.memoryThreshold)
-		} else if memoryGap < -1 && s.shouldConsumeMemory {
-			// 超出阈值，逐步释放内存
-			s.releasePartialMemory()
-			fmt.Printf("逐步释放内存占用 (当前超出 %.1f%%)\n", math.Abs(memoryGap))
-
-			// 如果超出太多，停止内存消费
+			go s.startMemoryConsumptionDynamic(targetSelfMemory)
+			fmt.Printf("🚀 开始增加内存占用，目标自身占用: %.1f%%\n", targetSelfMemory)
+		} else if memoryGap < -1 {
+			// 需要减少内存占用
 			if memoryGap < -3 {
+				// 差距较大，快速释放
+				s.releaseMemoryByPercentage(0.5) // 释放50%
+				fmt.Printf("⚡ 快速释放内存 (差距: %.1f%%)\n", memoryGap)
+			} else {
+				// 差距较小，缓慢释放
+				s.releaseMemoryByPercentage(0.2) // 释放20%
+				fmt.Printf("🔽 缓慢释放内存 (差距: %.1f%%)\n", memoryGap)
+			}
+
+			// 如果目标为0或差距过大，停止内存消费
+			if targetSelfMemory <= 0 || memoryGap < -5 {
 				s.shouldConsumeMemory = false
-				fmt.Println("超出阈值过多，停止内存占用")
+				fmt.Println("⏹️ 停止内存占用")
 			}
 		}
 	}
 }
 
-func (s *SystemTuneAgent) startMemoryConsumption() {
+func (s *SystemTuneAgent) startMemoryConsumptionDynamic(targetSelfMemory float64) {
 	for s.shouldConsumeMemory {
 		select {
 		case <-s.ctx.Done():
@@ -291,18 +402,28 @@ func (s *SystemTuneAgent) startMemoryConsumption() {
 		}
 
 		currentUsage := memInfo.UsedPercent
-		memoryGap := s.memoryThreshold - currentUsage
-
-		if memoryGap <= 0 {
-			time.Sleep(time.Second)
+		
+		// 重新估算当前状态
+		s.estimateBaseUsage(s.lastCPUUsage, currentUsage)
+		
+		// 检查是否还需要继续分配
+		currentGap := targetSelfMemory - s.selfMemoryUsage
+		if currentGap <= 1 || s.baseMemoryUsage >= s.memoryThreshold {
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
-		// 动态计算内存块大小 (5MB - 50MB)
-		blockSizeMB := int(math.Max(5, math.Min(50, memoryGap*2)))
+		// 动态计算内存块大小，基于差距和当前基础占用情况
+		blockSizeMB := int(math.Max(3, math.Min(30, currentGap*1.5)))
+		
+		// 如果基础占用接近阈值，使用更小的块
+		if s.baseMemoryUsage > s.memoryThreshold*0.8 {
+			blockSizeMB = int(math.Max(2, float64(blockSizeMB)*0.5))
+		}
+		
 		blockSize := blockSizeMB * 1024 * 1024
 
-		fmt.Printf("分配内存块: %dMB\n", blockSizeMB)
+		fmt.Printf("💾 分配内存块: %dMB (目标差距: %.1f%%)\n", blockSizeMB, currentGap)
 
 		// 分配并填充内存
 		memoryBlock := make([]byte, blockSize)
@@ -318,23 +439,34 @@ func (s *SystemTuneAgent) startMemoryConsumption() {
 		s.memoryMutex.Lock()
 		s.memoryBlocks = append(s.memoryBlocks, memoryBlock)
 
-		// 控制内存块数量
-		if len(s.memoryBlocks) > 100 {
+		// 控制内存块数量，防止过度分配
+		if len(s.memoryBlocks) > 150 {
 			s.memoryBlocks = s.memoryBlocks[1:]
 		}
 		s.memoryMutex.Unlock()
 
-		time.Sleep(300 * time.Millisecond)
+		// 动态调整分配间隔
+		sleepTime := 200 * time.Millisecond
+		if currentGap < 5 {
+			sleepTime = 500 * time.Millisecond // 接近目标时放慢速度
+		}
+		time.Sleep(sleepTime)
 	}
 }
 
 func (s *SystemTuneAgent) releasePartialMemory() {
+	s.releaseMemoryByPercentage(0.3)
+}
+
+func (s *SystemTuneAgent) releaseMemoryByPercentage(percentage float64) {
 	if len(s.memoryBlocks) == 0 {
 		return
 	}
 
-	// 释放 30% 的内存块
-	releaseCount := int(math.Max(1, float64(len(s.memoryBlocks))*0.3))
+	// 释放指定百分比的内存块
+	releaseCount := int(math.Max(1, float64(len(s.memoryBlocks))*percentage))
+	
+	fmt.Printf("🗑️ 释放 %d 个内存块 (%.0f%%)\n", releaseCount, percentage*100)
 
 	for i := 0; i < releaseCount && len(s.memoryBlocks) > 0; i++ {
 		s.memoryBlocks = s.memoryBlocks[1:]

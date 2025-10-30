@@ -1,56 +1,81 @@
 #!/bin/bash
 
-echo "构建 System Tune Agent (Go 版本)..."
+echo "🚀 开始构建 System Tune Agent (动态平衡版本)"
+echo "================================================"
 
-# 检查 Go 是否安装
-if ! command -v go &> /dev/null; then
-    echo "错误: 未找到 Go，请先安装 Go 1.19 或更高版本"
-    echo "下载地址: https://golang.org/dl/"
-    exit 1
-fi
+# 创建构建目录
+mkdir -p build
 
-# 显示 Go 版本
-echo "Go 版本: $(go version)"
+# 获取版本信息
+VERSION="v1.1.0-dynamic"
+BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-# 下载依赖
-echo "下载依赖..."
-go mod tidy
+# 构建标志
+LDFLAGS="-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}' -X 'main.GitCommit=${GIT_COMMIT}'"
 
-# 构建不同平台的可执行文件
-echo "构建可执行文件..."
+echo "📦 版本: ${VERSION}"
+echo "⏰ 构建时间: ${BUILD_TIME}"
+echo "🔗 Git提交: ${GIT_COMMIT}"
+echo ""
 
-# 当前平台
-echo "构建当前平台版本..."
-go build -ldflags="-s -w" -o system-tune-agent main.go
+# 构建函数
+build_target() {
+    local os=$1
+    local arch=$2
+    local ext=$3
+    local output="build/system-tune-agent-${os}-${arch}${ext}"
+    
+    echo "🔨 构建 ${os}/${arch}..."
+    GOOS=${os} GOARCH=${arch} go build -ldflags="${LDFLAGS}" -o "${output}" main.go
+    
+    if [ $? -eq 0 ]; then
+        size=$(ls -lh "${output}" | awk '{print $5}')
+        echo "✅ ${output} (${size})"
+    else
+        echo "❌ 构建失败: ${os}/${arch}"
+    fi
+}
 
-# Linux 64位
-echo "构建 Linux 64位版本..."
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o system-tune-agent-linux-amd64 main.go
+# 构建各平台版本
+echo "开始构建各平台版本..."
+echo ""
 
-# Windows 64位
-echo "构建 Windows 64位版本..."
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o system-tune-agent-windows-amd64.exe main.go
+# Linux
+build_target "linux" "amd64" ""
+build_target "linux" "arm64" ""
 
-# macOS 64位 (Intel)
-echo "构建 macOS Intel 版本..."
-GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o system-tune-agent-darwin-amd64 main.go
+# Windows  
+build_target "windows" "amd64" ".exe"
+build_target "windows" "arm64" ".exe"
 
-# macOS ARM64 (Apple Silicon)
-echo "构建 macOS Apple Silicon 版本..."
-GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o system-tune-agent-darwin-arm64 main.go
+# macOS
+build_target "darwin" "amd64" ""
+build_target "darwin" "arm64" ""
 
 echo ""
-echo "构建完成！生成的文件:"
-ls -lh system-tune-agent*
+echo "📋 构建完成！文件列表："
+ls -lh build/
 
 echo ""
-echo "运行示例:"
-echo "  ./system-tune-agent -c 75 -m 75"
-echo "  ./system-tune-agent --help"
+echo "📦 创建压缩包..."
+cd build
+for file in system-tune-agent-*; do
+    if [[ "$file" == *.exe ]]; then
+        zip "${file%.exe}.zip" "$file"
+        echo "📦 ${file%.exe}.zip"
+    else
+        tar -czf "${file}.tar.gz" "$file"
+        echo "📦 ${file}.tar.gz"
+    fi
+done
 
+cd ..
 echo ""
-echo "跨平台文件说明:"
-echo "  system-tune-agent-linux-amd64     - Linux 64位"
-echo "  system-tune-agent-windows-amd64.exe - Windows 64位"
-echo "  system-tune-agent-darwin-amd64     - macOS Intel"
-echo "  system-tune-agent-darwin-arm64     - macOS Apple Silicon"
+echo "🎉 所有构建完成！"
+echo "📁 文件位置: ./build/"
+echo ""
+echo "🚀 使用方法："
+echo "   Linux:   ./system-tune-agent-linux-amd64 -c 75 -m 75"
+echo "   Windows: system-tune-agent-windows-amd64.exe -c 75 -m 75"
+echo "   macOS:   ./system-tune-agent-darwin-amd64 -c 75 -m 75"
