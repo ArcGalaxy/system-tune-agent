@@ -39,6 +39,28 @@ func logf(format string, args ...interface{}) {
 	fmt.Fprintf(globalLogWriter, "[%s] %s", timestamp, message)
 }
 
+// 清理旧日志文件 (保留最近1天)
+func cleanupOldLogs(currentDir string) {
+	files, err := filepath.Glob(filepath.Join(currentDir, "system-tune-agent_*.log"))
+	if err != nil {
+		return
+	}
+
+	cutoffTime := time.Now().AddDate(0, 0, -1) // 1天前
+	
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		
+		if info.ModTime().Before(cutoffTime) {
+			os.Remove(file)
+			log.Printf("🗑️ 删除旧日志文件: %s", filepath.Base(file))
+		}
+	}
+}
+
 // 初始化全局日志
 func initGlobalLogging() {
 	currentDir, err := os.Getwd()
@@ -46,6 +68,9 @@ func initGlobalLogging() {
 		log.Printf("获取当前目录失败: %v", err)
 		return
 	}
+
+	// 清理旧日志文件
+	cleanupOldLogs(currentDir)
 
 	timestamp := time.Now().Format("20060102_150405")
 	logFileName := fmt.Sprintf("system-tune-agent_%s.log", timestamp)
@@ -86,7 +111,6 @@ type SystemTuneAgent struct {
 	// 内存控制 - 基于子进程
 	memoryWorkers       []*MemoryWorker
 	memoryMutex         sync.RWMutex
-	shouldConsumeMemory bool
 
 	// 备用内存控制 - Go内存块 (当子进程失败时使用)
 	memoryBlocks    [][]byte
@@ -103,13 +127,6 @@ type SystemTuneAgent struct {
 	userMemoryUsage        float64  // 用户程序的内存使用率
 	agentMemoryUsage       float64  // 本程序的内存使用率
 	lastAdjustmentTime     time.Time // 上次调整时间
-	memoryAdjustmentCooldown time.Duration // 调整冷却时间
-	
-	// 动态平衡控制
-	baseCPUUsage    float64
-	baseMemoryUsage float64
-	selfCPUUsage    float64
-	selfMemoryUsage float64
 
 	// 控制
 	ctx    context.Context
@@ -137,7 +154,6 @@ func NewSystemTuneAgent(cpuThreshold, memoryThreshold float64) *SystemTuneAgent 
 		targetMemoryUsage:        memoryThreshold,
 		userMemoryUsage:          baselineUsage,
 		agentMemoryUsage:         0.0,
-		memoryAdjustmentCooldown: 5 * time.Second, // 5秒冷却时间
 		ctx:                      ctx,
 		cancel:                   cancel,
 	}
@@ -581,44 +597,7 @@ func (s *SystemTuneAgent) smartAdjustMemoryConsumption(currentUsage float64) {
 	s.lastAdjustmentTime = time.Now()
 }
 
-// 调整内存消费 (保留原有接口用于兼容)
-func (s *SystemTuneAgent) adjustMemoryConsumption(targetUsage float64) {
-	s.memoryMutex.Lock()
-	defer s.memoryMutex.Unlock()
 
-	// 获取当前系统内存信息
-	memInfo, err := mem.VirtualMemory()
-	if err != nil {
-		logf("❌ 获取内存信息失败: %v\n", err)
-		return
-	}
-
-	currentUsage := memInfo.UsedPercent
-	totalMemoryMB := int(memInfo.Total / 1024 / 1024)
-	
-	// 计算当前工作进程占用的内存
-	currentWorkerMemoryMB := s.getCurrentWorkerMemory()
-	
-	// 计算需要的内存变化
-	usageDiff := targetUsage - currentUsage
-	memoryChangeMB := int(float64(totalMemoryMB) * usageDiff / 100.0)
-	
-	logf("📊 内存调整: 当前 %.1f%% -> 目标 %.1f%% (变化: %+dMB, 工作进程: %dMB)\n", 
-		currentUsage, targetUsage, memoryChangeMB, currentWorkerMemoryMB)
-
-	// 避免过小的调整
-	if abs(memoryChangeMB) < 50 {
-		return
-	}
-
-	if memoryChangeMB > 0 {
-		// 需要增加内存消费
-		s.addMemoryWorkers(memoryChangeMB)
-	} else if memoryChangeMB < 0 {
-		// 需要减少内存消费
-		s.removeMemoryWorkers(-memoryChangeMB)
-	}
-}
 
 // 获取当前工作进程占用的内存总量
 func (s *SystemTuneAgent) getCurrentWorkerMemory() int {
