@@ -147,7 +147,10 @@ system-tune-agent-windows-amd64.exe -c 20 -m 50
 ### Linux后台启动
 
 #### 方法1: 使用nohup (推荐)
-
+```bash
+# 启动之前先对对应的文件进行赋权
+chmod +x ./system-tune-agent-xxxxx（对应平台的文件名称）
+```
 **带日志输出版本：**
 ```bash
 # 后台启动，输出重定向到日志文件
