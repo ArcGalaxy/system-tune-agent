@@ -48,9 +48,9 @@ type SystemTuneAgent struct {
 	cpuThreshold    float64
 	memoryThreshold float64
 
-	// CPU 控制 - 单线程
+	// CPU 控制 - 多线程
 	cpuIntensity int
-	cpuWorker    context.CancelFunc
+	cpuWorkers   []context.CancelFunc
 	cpuMutex     sync.RWMutex
 
 	// 内存控制 - 基于子进程
@@ -91,6 +91,7 @@ func NewSystemTuneAgent(cpuThreshold, memoryThreshold float64) *SystemTuneAgent 
 	return &SystemTuneAgent{
 		cpuThreshold:             cpuThreshold,
 		memoryThreshold:          memoryThreshold,
+		cpuWorkers:               make([]context.CancelFunc, 0),
 		memoryWorkers:            make([]*MemoryWorker, 0),
 		memoryBlocks:             make([][]byte, 0),
 		fallbackMode:             false,
@@ -103,54 +104,63 @@ func NewSystemTuneAgent(cpuThreshold, memoryThreshold float64) *SystemTuneAgent 
 	}
 }
 
-// 启动单线程CPU控制
+// 启动多线程CPU控制
 func (s *SystemTuneAgent) startCPUWorker(intensity int) {
 	s.cpuMutex.Lock()
 	defer s.cpuMutex.Unlock()
 
 	// 清理现有工作线程
-	if s.cpuWorker != nil {
-		s.cpuWorker()
-		s.cpuWorker = nil
+	for _, cancel := range s.cpuWorkers {
+		cancel()
 	}
+	s.cpuWorkers = s.cpuWorkers[:0]
 
-	// 计算工作/休息比例
-	cycleMs := 100  // 100ms周期
+	// 动态计算CPU核数和线程策略
+	numCores := runtime.NumCPU()
+	
+	// 策略：使用所有核心，每个核心按比例工作
+	numWorkers := numCores
+	
+	// 每个线程的工作强度 = 目标强度
+	cycleMs := 100
 	workMs := (intensity * cycleMs) / 100
 	sleepMs := cycleMs - workMs
+
+	logf("START: 启动%d个CPU工作线程 (目标%d%%, 总核心%d, 每核心工作%dms/休息%dms)\n", 
+		numWorkers, intensity, numCores, workMs, sleepMs)
 	
-	// 确保最小工作时间
 	if workMs < 1 {
 		workMs = 1
 		sleepMs = cycleMs - 1
 	}
-	
-	ctx, cancel := context.WithCancel(s.ctx)
-	s.cpuWorker = cancel
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				// 工作阶段：燃烧CPU
-				start := time.Now()
-				workDuration := time.Duration(workMs) * time.Millisecond
-				for time.Since(start) < workDuration {
-					// 紧凑空循环，燃烧CPU
-					for j := 0; j < 10000; j++ {
-						_ = j * j // 简单计算防止被优化
+	for i := 0; i < numWorkers; i++ {
+		ctx, cancel := context.WithCancel(s.ctx)
+		s.cpuWorkers = append(s.cpuWorkers, cancel)
+
+		go func(workerID int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// 工作阶段：燃烧CPU
+					start := time.Now()
+					workDuration := time.Duration(workMs) * time.Millisecond
+					for time.Since(start) < workDuration {
+						for j := 0; j < 10000; j++ {
+							_ = j * j
+						}
+					}
+					
+					// 休息阶段：睡眠
+					if sleepMs > 0 {
+						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 					}
 				}
-				
-				// 休息阶段：睡眠
-				if sleepMs > 0 {
-					time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-				}
 			}
-		}
-	}()
+		}(i)
+	}
 
 	s.cpuIntensity = intensity
 }
@@ -160,10 +170,10 @@ func (s *SystemTuneAgent) stopCPUWorker() {
 	s.cpuMutex.Lock()
 	defer s.cpuMutex.Unlock()
 
-	if s.cpuWorker != nil {
-		s.cpuWorker()
-		s.cpuWorker = nil
+	for _, cancel := range s.cpuWorkers {
+		cancel()
 	}
+	s.cpuWorkers = s.cpuWorkers[:0]
 	s.cpuIntensity = 0
 }
 
@@ -714,7 +724,7 @@ func (s *SystemTuneAgent) performDynamicBalance() {
 
 // 启动代理
 func (s *SystemTuneAgent) Start() error {
-	logf("�  CPU阈值%.1f%% (最大%d%%) | 内存阈值%.1f%%\n", s.cpuThreshold, maxCPUThreshold, s.memoryThreshold)
+	logf(" CPU阈值%.1f%% (最大%d%%) | 内存阈值%.1f%%\n", s.cpuThreshold, maxCPUThreshold, s.memoryThreshold)
 
 	// 设置信号处理
 	sigChan := make(chan os.Signal, 1)
